@@ -8,6 +8,7 @@
 <title>Gate Container Check</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Anton&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.103.2/dist/umd/supabase.js"></script>
 <style>
 /* Layout: night-shift ops console — dark navy field, a gold crest
    header with a rainbow checkpoint stripe, glow-tile photo/number
@@ -214,6 +215,9 @@ input:focus, textarea:focus{border-color:var(--gold);}
   position:absolute; top:6px; right:6px; width:9px; height:9px; border-radius:50%;
   background:var(--ok); border:1.5px solid var(--bg); box-shadow:0 0 6px var(--ok);
 }
+.phototile .ph-status.pending{background:#ffb545; box-shadow:0 0 6px #ffb545; animation:pulse 1s infinite;}
+.phototile .ph-status.failed{background:var(--danger); box-shadow:0 0 6px var(--danger);}
+@keyframes pulse{0%,100%{opacity:1;}50%{opacity:.4;}}
 .photo-hint{font-size:11.5px; color:var(--muted); margin-top:7px;}
 
 /* success sheet */
@@ -414,6 +418,14 @@ input:focus, textarea:focus{border-color:var(--gold);}
 
   document.getElementById("todayLabel").textContent = fmtDateLong(new Date());
 
+  // ---------- Supabase (live, shared log + photo storage) ----------
+  var SUPABASE_URL = "https://ztbsnoxeryekmkplyhlo.supabase.co";
+  var SUPABASE_ANON_KEY = "sb_publishable_CHfXaIrzo0wDh1_bqEat9Q_Cv4ZE9wL";
+  var PHOTOS_BUCKET = "inspection-photos";
+  var sb = (window.supabase && window.supabase.createClient)
+    ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
+    : null;
+
   // ---------- tabs ----------
   var tabNew = document.getElementById("tabNew");
   var tabLog = document.getElementById("tabLog");
@@ -428,7 +440,7 @@ input:focus, textarea:focus{border-color:var(--gold);}
     viewNew.hidden = !onNew;
     viewLog.hidden = onNew;
     submitBtn.hidden = !onNew;
-    if (!onNew){ document.getElementById("formErrDock").classList.remove("show"); renderLog(); }
+    if (!onNew){ document.getElementById("formErrDock").classList.remove("show"); fetchTodayLog(); }
   }
   tabNew.addEventListener("click", function(){ showTab("new"); });
   tabLog.addEventListener("click", function(){ showTab("log"); });
@@ -472,9 +484,14 @@ input:focus, textarea:focus{border-color:var(--gold);}
   var PHOTO_ORDER = ["containerNumber","sealNumber","sideFront","sideRear","sideLeft","sideRight"];
   var CAMERA_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 8h3l1.5-2h7L17 8h3a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1z"/><circle cx="12" cy="13.5" r="3.4"/></svg>';
 
+  // One id per in-progress check, assigned up front so a photo can start
+  // uploading to Supabase Storage the moment it's taken (not at submit).
+  var currentReportId = makeReportId(new Date());
+
   function freshPhotoState(){
     var p = {};
-    PHOTO_ORDER.forEach(function(k){ p[k] = { dataUrl:null }; });
+    // status: "empty" | "ready" (resized, not yet uploaded) | "pending" | "uploaded" | "failed"
+    PHOTO_ORDER.forEach(function(k){ p[k] = { dataUrl:null, publicUrl:null, status:"empty" }; });
     return p;
   }
   var photos = freshPhotoState();
@@ -495,10 +512,11 @@ input:focus, textarea:focus{border-color:var(--gold);}
       return;
     }
     tile.classList.add("filled");
+    var dotClass = p.status === "uploaded" ? "" : (p.status === "failed" ? "failed" : "pending");
     tile.innerHTML =
       '<img src="' + p.dataUrl + '" alt="' + meta.label + ' photo">' +
       '<span class="ph-label">' + meta.label + '</span>' +
-      '<span class="ph-status"></span>';
+      '<span class="ph-status ' + dotClass + '"></span>';
   }
   PHOTO_ORDER.forEach(renderTile);
 
@@ -522,6 +540,31 @@ input:focus, textarea:focus{border-color:var(--gold);}
       reader.readAsDataURL(file);
     });
   }
+  function dataUrlToBlob(dataUrl){
+    var parts = dataUrl.split(",");
+    var mime = parts[0].match(/:(.*?);/)[1];
+    var bin = atob(parts[1]);
+    var arr = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+    return new Blob([arr], { type: mime });
+  }
+
+  function uploadPhoto(key, reportId){
+    var p = photos[key];
+    if (!sb){ p.status = "failed"; renderTile(key); return; }
+    p.status = "pending"; renderTile(key);
+    var path = reportId + "/" + key + ".jpg";
+    sb.storage.from(PHOTOS_BUCKET)
+      .upload(path, dataUrlToBlob(p.dataUrl), { contentType:"image/jpeg", upsert:true })
+      .then(function(res){
+        if (res.error) throw res.error;
+        var pub = sb.storage.from(PHOTOS_BUCKET).getPublicUrl(path);
+        p.publicUrl = pub.data.publicUrl;
+        p.status = "uploaded";
+        renderTile(key);
+      })
+      .catch(function(){ p.status = "failed"; renderTile(key); });
+  }
 
   document.querySelectorAll(".phototile").forEach(function(tile){
     tile.addEventListener("click", function(){
@@ -536,7 +579,9 @@ input:focus, textarea:focus{border-color:var(--gold);}
     var key = activePhotoKey;
     resizeToDataUrl(file, 1280, 0.82).then(function(dataUrl){
       photos[key].dataUrl = dataUrl;
+      photos[key].status = "ready";
       renderTile(key);
+      uploadPhoto(key, currentReportId);
     });
   });
 
@@ -554,6 +599,7 @@ input:focus, textarea:focus{border-color:var(--gold);}
     document.getElementById("damageFix").hidden = true;
     document.getElementById("formErrDock").classList.remove("show");
     resetPhotos();
+    currentReportId = makeReportId(new Date());
   }
 
   function collectRecord(){
@@ -571,7 +617,7 @@ input:focus, textarea:focus{border-color:var(--gold);}
     var now = new Date();
 
     return {
-      reportId: makeReportId(now),
+      reportId: currentReportId,
       createdAtMs: now.getTime(),
       createdAtLabel: fmtDateLong(now) + " · " + fmtTime(now),
       guardName: val("guardName"),
@@ -692,73 +738,43 @@ input:focus, textarea:focus{border-color:var(--gold);}
 
   var lastRecord = null, lastPdf = null;
 
-  // ---------- local, on-device log (no server; this device only) ----------
-  var LOG_KEY = "gateCheckLog.v1";
-  var LOG_RETENTION_DAYS = 30;
-
-  function readLogStore(){
-    try {
-      var raw = localStorage.getItem(LOG_KEY);
-      return raw ? JSON.parse(raw) : [];
-    } catch (e) { return []; }
-  }
-  function writeLogStore(entries){
-    try {
-      localStorage.setItem(LOG_KEY, JSON.stringify(entries));
-      return true;
-    } catch (e) { return false; }
-  }
-  function pruneOld(entries){
-    var cutoff = Date.now() - LOG_RETENTION_DAYS * 86400000;
-    return entries.filter(function(e){ return e.createdAtMs >= cutoff; });
-  }
-
-  function thumbFromDataUrl(dataUrl){
-    // Small re-encode of an already-resized photo, just for the on-device log card.
+  // ---------- live, shared log (Supabase) ----------
+  function waitForUploads(timeoutMs){
     return new Promise(function(resolve){
-      var img = new Image();
-      img.onload = function(){
-        var maxDim = 160;
-        var scale = Math.min(1, maxDim / Math.max(img.width, img.height));
-        var cw = Math.round(img.width * scale), ch = Math.round(img.height * scale);
-        var canvas = document.createElement("canvas");
-        canvas.width = cw; canvas.height = ch;
-        canvas.getContext("2d").drawImage(img, 0, 0, cw, ch);
-        resolve(canvas.toDataURL("image/jpeg", 0.5));
-      };
-      img.onerror = function(){ resolve(null); };
-      img.src = dataUrl;
+      var start = Date.now();
+      (function poll(){
+        var pending = PHOTO_ORDER.some(function(k){ return photos[k].status === "pending"; });
+        if (!pending || Date.now() - start > timeoutMs) return resolve();
+        setTimeout(poll, 200);
+      })();
     });
   }
 
   function saveToLog(rec){
-    var thumbKeys = PHOTO_ORDER.filter(function(k){ return rec.photos[k] && rec.photos[k].dataUrl; });
-    return Promise.all(thumbKeys.map(function(k){ return thumbFromDataUrl(rec.photos[k].dataUrl); }))
-      .then(function(thumbs){
-        var entry = {
-          reportId: rec.reportId,
-          createdAtMs: rec.createdAtMs,
-          createdAtLabel: rec.createdAtLabel,
-          guardName: rec.guardName || null,
-          containerNumberFinal: rec.containerNumberFinal,
-          containerCorrect: rec.containerCorrect,
-          sealNumberFinal: rec.sealNumberFinal,
-          sealCorrect: rec.sealCorrect,
-          damage: rec.damage,
-          damageDescription: rec.damageDescription || null,
-          thumbs: thumbs.filter(Boolean)
-        };
-        var entries = pruneOld(readLogStore());
-        entries.unshift(entry);
-        var ok = writeLogStore(entries);
-        if (!ok){
-          // Storage full — retry without photo thumbnails, text only.
-          entry.thumbs = [];
-          entries[0] = entry;
-          ok = writeLogStore(entries);
-        }
-        return ok;
-      });
+    if (!sb) return Promise.reject(new Error("no-supabase-client"));
+    var row = {
+      report_id: rec.reportId,
+      created_at: new Date(rec.createdAtMs).toISOString(),
+      guard_name: rec.guardName || null,
+      container_number_entered: rec.containerNumberEntered,
+      container_correct: rec.containerCorrect,
+      container_number_final: rec.containerNumberFinal,
+      seal_number_entered: rec.sealNumberEntered,
+      seal_correct: rec.sealCorrect,
+      seal_number_final: rec.sealNumberFinal,
+      damage: rec.damage,
+      damage_description: rec.damageDescription || null,
+      container_number_photo_url: rec.photos.containerNumber.publicUrl,
+      seal_photo_url: rec.photos.sealNumber.publicUrl,
+      side_front_photo_url: rec.photos.sideFront.publicUrl,
+      side_rear_photo_url: rec.photos.sideRear.publicUrl,
+      side_left_photo_url: rec.photos.sideLeft.publicUrl,
+      side_right_photo_url: rec.photos.sideRight.publicUrl
+    };
+    return sb.from("inspections").insert(row).then(function(res){
+      if (res.error) throw res.error;
+      return true;
+    });
   }
 
   document.getElementById("submitBtn").addEventListener("click", function(){
@@ -773,7 +789,9 @@ input:focus, textarea:focus{border-color:var(--gold);}
     var pdfDoc = buildPdf(rec);
     lastRecord = rec; lastPdf = pdfDoc;
 
-    saveToLog(rec)
+    waitForUploads(8000)
+      .then(function(){ return saveToLog(rec); })
+      .then(function(){ return true; })
       .catch(function(){ return false; })
       .then(function(saved){
         downloadPdf(pdfDoc, rec);
@@ -786,13 +804,13 @@ input:focus, textarea:focus{border-color:var(--gold);}
   // ---------- success sheet ----------
   var sheetBackdrop = document.getElementById("sheetBackdrop");
   function openSheet(saved){
-    document.getElementById("sheetSaveLine").textContent = saved ? "Logged to today's log" : "PDF created";
+    document.getElementById("sheetSaveLine").textContent = saved ? "Logged to the live log" : "PDF created";
     var note = document.getElementById("savenote");
     if (saved){
       note.textContent = "";
       note.classList.remove("warn");
     } else {
-      note.textContent = "Couldn't save to this device's log (storage may be full). The PDF download is unaffected.";
+      note.textContent = "Couldn't reach the live log just now. The PDF download is unaffected — you can retry the Log tab later.";
       note.classList.add("warn");
     }
     sheetBackdrop.hidden = false;
@@ -813,9 +831,10 @@ input:focus, textarea:focus{border-color:var(--gold);}
     }
   });
 
-  // ---------- log tab (this device, today) ----------
+  // ---------- log tab (live, shared across every device) ----------
   var logList = document.getElementById("logList");
   var logCount = document.getElementById("logCount");
+  var logRows = [];
 
   function badge(ok){
     return ok ? '<span class="badge ok">OK</span>' : '<span class="badge flag">Flagged</span>';
@@ -825,38 +844,73 @@ input:focus, textarea:focus{border-color:var(--gold);}
       return { "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c];
     });
   }
-  function renderLog(){
-    var todayStartMs = (function(){ var d = new Date(); d.setHours(0,0,0,0); return d.getTime(); })();
-    var docs = pruneOld(readLogStore()).filter(function(e){ return e.createdAtMs >= todayStartMs; });
-
+  function paintLog(){
+    var docs = logRows;
     logCount.textContent = String(docs.length);
     logCount.hidden = docs.length === 0;
     if (!docs.length){
-      logList.innerHTML = '<div class="empty">No containers logged yet today. Entries you log appear here, on this device.</div>';
+      logList.innerHTML = sb
+        ? '<div class="empty">No containers logged yet today. Entries appear here live, from every device.</div>'
+        : '<div class="empty">The live log is unavailable right now.</div>';
       return;
     }
     logList.innerHTML = docs.map(function(r){
-      var flagged = (r.containerCorrect === false) || (r.sealCorrect === false) || (r.damage === true);
-      var dmgLine = r.damage ? '<div class="dmg">⚠ ' + escapeHtml(r.damageDescription || "Damage reported") + '</div>' : "";
-      var thumbs = r.thumbs || [];
+      var flagged = (r.container_correct === false) || (r.seal_correct === false) || (r.damage === true);
+      var dmgLine = r.damage ? '<div class="dmg">⚠ ' + escapeHtml(r.damage_description || "Damage reported") + '</div>' : "";
+      var thumbs = [
+        r.container_number_photo_url, r.seal_photo_url,
+        r.side_front_photo_url, r.side_rear_photo_url, r.side_left_photo_url, r.side_right_photo_url
+      ].filter(Boolean);
       var thumbsRow = thumbs.length
         ? '<div style="display:flex;gap:6px;margin-top:9px;flex-wrap:wrap;">' +
-            thumbs.map(function(u){ return '<img src="' + u + '" alt="Inspection photo" style="width:44px;height:44px;object-fit:cover;border-radius:6px;border:1px solid var(--border);">'; }).join("") +
+            thumbs.map(function(u){ return '<a href="' + u + '" target="_blank" rel="noopener"><img src="' + u + '" alt="Inspection photo" style="width:44px;height:44px;object-fit:cover;border-radius:6px;border:1px solid var(--border);"></a>'; }).join("") +
           '</div>'
         : "";
+      var timeLabel = fmtDateLong(new Date(r.created_at)) + " · " + fmtTime(new Date(r.created_at));
       return '' +
         '<div class="logitem">' +
-          '<div class="row1"><span class="time">' + escapeHtml(r.createdAtLabel || "") + '</span>' + badge(!flagged) + '</div>' +
+          '<div class="row1"><span class="time">' + escapeHtml(timeLabel) + '</span>' + badge(!flagged) + '</div>' +
           '<dl>' +
-            '<dt>Container</dt><dd>' + escapeHtml(r.containerNumberFinal || "") + (r.containerCorrect === false ? ' <span style="color:var(--muted);font-family:var(--font-body)">(corrected)</span>' : '') + '</dd>' +
-            '<dt>Seal</dt><dd>' + escapeHtml(r.sealNumberFinal || "") + (r.sealCorrect === false ? ' <span style="color:var(--muted);font-family:var(--font-body)">(corrected)</span>' : '') + '</dd>' +
-            (r.guardName ? '<dt>Guard</dt><dd style="font-family:var(--font-body)">' + escapeHtml(r.guardName) + '</dd>' : '') +
+            '<dt>Container</dt><dd>' + escapeHtml(r.container_number_final || "") + (r.container_correct === false ? ' <span style="color:var(--muted);font-family:var(--font-body)">(corrected)</span>' : '') + '</dd>' +
+            '<dt>Seal</dt><dd>' + escapeHtml(r.seal_number_final || "") + (r.seal_correct === false ? ' <span style="color:var(--muted);font-family:var(--font-body)">(corrected)</span>' : '') + '</dd>' +
+            (r.guard_name ? '<dt>Guard</dt><dd style="font-family:var(--font-body)">' + escapeHtml(r.guard_name) + '</dd>' : '') +
           '</dl>' +
           dmgLine + thumbsRow +
         '</div>';
     }).join("");
   }
-  renderLog();
+
+  function todayStartIso(){
+    var d = new Date(); d.setHours(0,0,0,0); return d.toISOString();
+  }
+
+  function fetchTodayLog(){
+    if (!sb){ paintLog(); return; }
+    sb.from("inspections")
+      .select("*")
+      .gte("created_at", todayStartIso())
+      .order("created_at", { ascending:false })
+      .limit(200)
+      .then(function(res){
+        if (res.error) return;
+        logRows = res.data || [];
+        paintLog();
+      });
+  }
+
+  fetchTodayLog();
+
+  if (sb){
+    sb.channel("inspections-live")
+      .on("postgres_changes", { event:"INSERT", schema:"public", table:"inspections" }, function(payload){
+        var row = payload.new;
+        var todayStart = new Date(); todayStart.setHours(0,0,0,0);
+        if (new Date(row.created_at) < todayStart) return;
+        logRows = [row].concat(logRows.filter(function(r){ return r.report_id !== row.report_id; }));
+        paintLog();
+      })
+      .subscribe();
+  }
 
 })();
 </script>
